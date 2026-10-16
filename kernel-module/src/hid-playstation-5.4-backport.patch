@@ -1,0 +1,36 @@
+--- a/drivers/hid/hid-playstation.c	2026-10-16 08:29:14.386200587 +0300
++++ b/drivers/hid/hid-playstation.c	2026-10-16 05:25:48.466859798 +0300
+@@ -22,6 +22,8 @@
+ /* List of connected playstation devices. */
+ static DEFINE_MUTEX(ps_devices_lock);
+ static LIST_HEAD(ps_devices_list);
++static bool ds5_debug;
++module_param(ds5_debug, bool, 0644);
+ 
+ static DEFINE_IDA(ps_player_id_allocator);
+ 
+@@ -839,8 +841,9 @@
+ 
+ 	ret = devm_led_classdev_multicolor_register(&hdev->dev, lightbar_mc_dev);
+ 	if (ret < 0) {
+-		hid_err(hdev, "Cannot register multicolor LED device\n");
+-		return ret;
++		/* 5.4 backport: no LED multicolor class; lightbar stays driver-controlled. */
++		hid_info(hdev, "Multicolor LED class unavailable, lightbar sysfs disabled\n");
++		return 0;
+ 	}
+ 
+ 	return 0;
+@@ -1240,7 +1243,11 @@
+ 		report->bt->crc32 = cpu_to_le32(crc);
+ 	}
+ 
+-	hid_hw_output_report(hdev, report->data, report->len);
++	{
++		int r = hid_hw_output_report(hdev, report->data, report->len);
++		if (ds5_debug)
++			hid_info(hdev, "out len=%u ret=%d %*ph\n", report->len, r, 48, report->data);
++	}
+ }
+ 
+ static void dualsense_output_worker(struct work_struct *work)

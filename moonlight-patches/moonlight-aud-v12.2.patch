@@ -1,0 +1,521 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index c9cc3e47..86c9271a 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -118,8 +118,8 @@ android {
+             // is to please change the applicationId before you publish.
+             //
+             // TL;DR: Leave the following line alone!
+-            applicationIdSuffix ".unofficial"
+-            resValue "string", "app_label", "Moonlight"
++            applicationIdSuffix ".aud"
++            resValue "string", "app_label", "Moonlight AUD"
+             resValue "string", "app_label_root", "Moonlight (Root)"
+ 
+             minifyEnabled true
+diff --git a/app/src/main/java/com/limelight/Game.java b/app/src/main/java/com/limelight/Game.java
+index 8d369b3e..5bf4ca4b 100644
+--- a/app/src/main/java/com/limelight/Game.java
++++ b/app/src/main/java/com/limelight/Game.java
+@@ -58,6 +58,8 @@ import android.net.ConnectivityManager;
+ import android.net.wifi.WifiManager;
+ import android.os.Build;
+ import android.os.Bundle;
++import android.util.Log;
++import android.os.Looper;
+ import android.os.Handler;
+ import android.os.IBinder;
+ import android.util.Rational;
+@@ -185,6 +187,26 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
+ 
++        // Android 12's InputDeviceSensorManager can throw an NPE on its listener thread
++        // (fixed upstream in 8970010a). Swallow it there instead of killing the stream,
++        // so gamepad motion sensors can stay enabled on Android 12 boxes.
++        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.S) {
++            final Thread.UncaughtExceptionHandler previousHandler = Thread.getDefaultUncaughtExceptionHandler();
++            Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
++                @Override
++                public void uncaughtException(Thread t, Throwable e) {
++                    if (t != Looper.getMainLooper().getThread() && e instanceof NullPointerException &&
++                            Log.getStackTraceString(e).contains("InputDeviceSensorManager")) {
++                        LimeLog.warning("Ignoring Android 12 InputDeviceSensorManager crash on " + t.getName());
++                        return;
++                    }
++                    if (previousHandler != null) {
++                        previousHandler.uncaughtException(t, e);
++                    }
++                }
++            });
++        }
++
+         UiHelper.setLocale(this);
+ 
+         // We don't want a title bar
+@@ -2502,6 +2524,12 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+         controllerHandler.handleSetControllerLED(controllerNumber, r, g, b);
+     }
+ 
++    @Override
++    public void setAdaptiveTriggers(short controllerNumber, byte eventFlags, byte typeLeft, byte typeRight, byte[] left, byte[] right) {
++        LimeLog.info(String.format((Locale)null, "Adaptive triggers on gamepad %d: flags %02x types %02x/%02x", controllerNumber, eventFlags, typeLeft, typeRight));
++        controllerHandler.handleSetAdaptiveTriggers(controllerNumber, eventFlags, typeLeft, typeRight, left, right);
++    }
++
+     @Override
+     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+         if (!surfaceCreated) {
+diff --git a/app/src/main/java/com/limelight/binding/input/ControllerHandler.java b/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
+index 0fffe5d0..414203dc 100644
+--- a/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
++++ b/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
+@@ -795,6 +795,12 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+             }
+         }
+ 
++        // DualSense lightbar and adaptive triggers go straight to hidraw when available
++        context.dsHidraw = DualSenseHidraw.open(dev);
++        if (context.dsHidraw != null) {
++            context.hasRgbLed = true;
++        }
++
+         // Detect if the gamepad has Mode and Select buttons according to the Android key layouts.
+         // We do this first because other codepaths below may override these defaults.
+         boolean[] buttons = dev.hasKeys(KeyEvent.KEYCODE_BUTTON_MODE, KeyEvent.KEYCODE_BUTTON_SELECT, KeyEvent.KEYCODE_BACK, 0);
+@@ -2322,6 +2328,26 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+         }
+     }
+ 
++    public void handleSetAdaptiveTriggers(short controllerNumber, final byte eventFlags, final byte typeLeft, final byte typeRight, final byte[] left, final byte[] right) {
++        if (stopped) {
++            return;
++        }
++
++        for (int i = 0; i < inputDeviceContexts.size(); i++) {
++            InputDeviceContext deviceContext = inputDeviceContexts.valueAt(i);
++
++            if (deviceContext.controllerNumber == controllerNumber && deviceContext.dsHidraw != null) {
++                final DualSenseHidraw hidraw = deviceContext.dsHidraw;
++                backgroundThreadHandler.post(new Runnable() {
++                    @Override
++                    public void run() {
++                        hidraw.setTriggers(eventFlags, typeLeft, typeRight, left, right);
++                    }
++                });
++            }
++        }
++    }
++
+     public boolean handleButtonUp(KeyEvent event) {
+         InputDeviceContext context = getContextForEvent(event);
+         if (context == null) {
+@@ -2950,6 +2976,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+         public InputDevice inputDevice;
+ 
+         public boolean hasRgbLed;
++        public DualSenseHidraw dsHidraw;
+         public LightsManager.LightsSession lightsSession;
+         public int ledArgbValue;
+ 
+@@ -3032,6 +3059,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+             @TargetApi(Build.VERSION_CODES.S)
+             @Override
+             public void run() {
++                if (dsHidraw != null) {
++                    dsHidraw.setLightbar((ledArgbValue >> 16) & 0xFF, (ledArgbValue >> 8) & 0xFF, ledArgbValue & 0xFF);
++                    return;
++                }
++
+                 LightState lightState = new LightState.Builder().setColor(ledArgbValue).build();
+ 
+                 // Set the RGB value for each RGB-controllable LED on the device
+@@ -3070,6 +3102,18 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+             backgroundThreadHandler.removeCallbacks(enableSensorRunnable);
+             backgroundThreadHandler.removeCallbacks(setLedStateRunnable);
+ 
++            if (dsHidraw != null) {
++                final DualSenseHidraw hidraw = dsHidraw;
++                dsHidraw = null;
++                backgroundThreadHandler.post(new Runnable() {
++                    @Override
++                    public void run() {
++                        hidraw.resetTriggers();
++                        hidraw.close();
++                    }
++                });
++            }
++
+             if (gyroListener != null) {
+                 sensorManager.unregisterListener(gyroListener);
+             }
+diff --git a/app/src/main/java/com/limelight/binding/input/DualSenseHidraw.java b/app/src/main/java/com/limelight/binding/input/DualSenseHidraw.java
+new file mode 100644
+index 00000000..6d7d24d5
+--- /dev/null
++++ b/app/src/main/java/com/limelight/binding/input/DualSenseHidraw.java
+@@ -0,0 +1,179 @@
++package com.limelight.binding.input;
++
++import android.view.InputDevice;
++
++import com.limelight.LimeLog;
++
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.FileReader;
++import java.io.IOException;
++import java.util.zip.CRC32;
++
++// Writes DualSense output reports (lightbar, adaptive triggers) directly to the
++// controller's hidraw node. Used where the kernel driver doesn't expose these
++// features through Android's LightsManager (e.g. 5.4 kernels without LED multicolor).
++public class DualSenseHidraw {
++    private static final int SONY_VID = 0x054c;
++    private static final int DS5_PID = 0x0ce6;
++    private static final int DS5_EDGE_PID = 0x0df2;
++
++    // Offsets inside the common output report section
++    private static final int VALID_FLAG0 = 0;
++    private static final int VALID_FLAG1 = 1;
++    private static final int RIGHT_TRIGGER = 10;
++    private static final int LEFT_TRIGGER = 21;
++    private static final int LIGHTBAR_RGB = 44;
++    private static final int COMMON_SIZE = 47;
++
++    private static final int FLAG0_RIGHT_TRIGGER = 0x04;
++    private static final int FLAG0_LEFT_TRIGGER = 0x08;
++    private static final int FLAG1_LIGHTBAR = 0x04;
++
++    // Trigger effect type that turns resistance off
++    private static final byte TRIGGER_EFFECT_OFF = 0x05;
++
++    private final String path;
++    private final boolean bluetooth;
++    private FileOutputStream out;
++    private int seq;
++
++    private DualSenseHidraw(String path, boolean bluetooth) {
++        this.path = path;
++        this.bluetooth = bluetooth;
++    }
++
++    public static boolean isDualSense(InputDevice dev) {
++        return dev.getVendorId() == SONY_VID &&
++                (dev.getProductId() == DS5_PID || dev.getProductId() == DS5_EDGE_PID);
++    }
++
++    public static DualSenseHidraw open(InputDevice dev) {
++        if (!isDualSense(dev)) {
++            return null;
++        }
++
++        File[] nodes = new File("/sys/class/hidraw").listFiles();
++        if (nodes == null) {
++            return null;
++        }
++
++        String wantedProduct = String.format("%08X", dev.getProductId());
++        DualSenseHidraw fallback = null;
++        for (File node : nodes) {
++            String hidId = null, hidName = null;
++            try (BufferedReader reader = new BufferedReader(new FileReader(new File(node, "device/uevent")))) {
++                String line;
++                while ((line = reader.readLine()) != null) {
++                    if (line.startsWith("HID_ID=")) {
++                        hidId = line.substring(7).toUpperCase();
++                    }
++                    else if (line.startsWith("HID_NAME=")) {
++                        hidName = line.substring(9);
++                    }
++                }
++            } catch (IOException e) {
++                continue;
++            }
++
++            // HID_ID is BUS:VENDOR:PRODUCT, e.g. 0005:0000054C:00000DF2
++            if (hidId == null || !hidId.endsWith("0000054C:" + wantedProduct)) {
++                continue;
++            }
++
++            DualSenseHidraw candidate = new DualSenseHidraw("/dev/" + node.getName(), hidId.startsWith("0005:"));
++            if (dev.getName().equals(hidName)) {
++                fallback = candidate;
++                break;
++            }
++            if (fallback == null) {
++                fallback = candidate;
++            }
++        }
++
++        if (fallback != null) {
++            LimeLog.info("DualSense hidraw for " + dev.getName() + ": " + fallback.path +
++                    (fallback.bluetooth ? " (BT)" : " (USB)"));
++        }
++        return fallback;
++    }
++
++    public synchronized void setLightbar(int r, int g, int b) {
++        byte[] common = new byte[COMMON_SIZE];
++        common[VALID_FLAG1] = FLAG1_LIGHTBAR;
++        common[LIGHTBAR_RGB] = (byte) r;
++        common[LIGHTBAR_RGB + 1] = (byte) g;
++        common[LIGHTBAR_RGB + 2] = (byte) b;
++        send(common);
++    }
++
++    public synchronized void setTriggers(byte eventFlags, byte typeLeft, byte typeRight, byte[] left, byte[] right) {
++        byte[] common = new byte[COMMON_SIZE];
++        if ((eventFlags & FLAG0_RIGHT_TRIGGER) != 0) {
++            common[VALID_FLAG0] |= FLAG0_RIGHT_TRIGGER;
++            common[RIGHT_TRIGGER] = typeRight;
++            System.arraycopy(right, 0, common, RIGHT_TRIGGER + 1, Math.min(right.length, 10));
++        }
++        if ((eventFlags & FLAG0_LEFT_TRIGGER) != 0) {
++            common[VALID_FLAG0] |= FLAG0_LEFT_TRIGGER;
++            common[LEFT_TRIGGER] = typeLeft;
++            System.arraycopy(left, 0, common, LEFT_TRIGGER + 1, Math.min(left.length, 10));
++        }
++        if (common[VALID_FLAG0] != 0) {
++            send(common);
++        }
++    }
++
++    public synchronized void resetTriggers() {
++        byte[] common = new byte[COMMON_SIZE];
++        common[VALID_FLAG0] = FLAG0_RIGHT_TRIGGER | FLAG0_LEFT_TRIGGER;
++        common[RIGHT_TRIGGER] = TRIGGER_EFFECT_OFF;
++        common[LEFT_TRIGGER] = TRIGGER_EFFECT_OFF;
++        send(common);
++    }
++
++    public synchronized void close() {
++        if (out != null) {
++            try {
++                out.close();
++            } catch (IOException ignored) {}
++            out = null;
++        }
++    }
++
++    private void send(byte[] common) {
++        byte[] report;
++        if (bluetooth) {
++            report = new byte[78];
++            report[0] = 0x31;
++            report[1] = (byte) ((seq++ & 0x0f) << 4);
++            report[2] = 0x10;
++            System.arraycopy(common, 0, report, 3, COMMON_SIZE);
++
++            CRC32 crc = new CRC32();
++            crc.update(0xa2);
++            crc.update(report, 0, report.length - 4);
++            long value = crc.getValue();
++            report[74] = (byte) value;
++            report[75] = (byte) (value >> 8);
++            report[76] = (byte) (value >> 16);
++            report[77] = (byte) (value >> 24);
++        }
++        else {
++            report = new byte[48];
++            report[0] = 0x02;
++            System.arraycopy(common, 0, report, 1, COMMON_SIZE);
++        }
++
++        try {
++            if (out == null) {
++                out = new FileOutputStream(path);
++            }
++            out.write(report);
++        } catch (IOException e) {
++            LimeLog.warning("DualSense hidraw write failed on " + path + ": " + e.getMessage());
++            close();
++        }
++    }
++}
+diff --git a/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java b/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
+index 5d4e44ec..6d76e2d6 100644
+--- a/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
++++ b/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
+@@ -110,6 +110,31 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+ 
+     private long lastTimestampUs;
+     private int lastFrameNumber;
++
++    // Allwinner CedarX only closes an Annex B frame when it sees the next AU's first NAL,
++    // which delays every frame by one frame interval. Appending an AUD terminates the
++    // current frame immediately. The AUD is then attributed to the next frame, so the
++    // decoder reports the previous input timestamp; audPtsSuccessor maps it back.
++    private static final byte[] HEVC_AUD = {0x00, 0x00, 0x00, 0x01, 0x46, 0x01, 0x50};
++    private boolean appendHevcAud;
++    private long lastAudFrameTimestampUs;
++    private final java.util.LinkedHashMap<Long, Long> audPtsSuccessor =
++            new java.util.LinkedHashMap<Long, Long>() {
++                @Override
++                protected boolean removeEldestEntry(java.util.Map.Entry<Long, Long> eldest) {
++                    return size() > 256;
++                }
++            };
++
++    private long fixupOutputTimestampUs(long presentationTimeUs) {
++        if (!appendHevcAud) {
++            return presentationTimeUs;
++        }
++        synchronized (audPtsSuccessor) {
++            Long real = audPtsSuccessor.get(presentationTimeUs);
++            return real != null ? real : presentationTimeUs;
++        }
++    }
+     private long baseTimestampUs;
+     private int refreshRate;
+     private PreferenceConfiguration prefs;
+@@ -376,6 +401,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+             return false;
+         }
+ 
++        // Allwinner's OMX HEVC decoder handles Main10 but doesn't advertise HEVCProfileMain10HDR10
++        if (hevcDecoder.getName().toLowerCase().startsWith("omx.allwinner")) {
++            LimeLog.info("HEVC decoder "+hevcDecoder.getName()+" assumed to support HEVC Main10 HDR10");
++            return true;
++        }
++
+         for (MediaCodecInfo.CodecProfileLevel profileLevel : hevcDecoder.getCapabilitiesForType("video/hevc").profileLevels) {
+             if (profileLevel.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10) {
+                 LimeLog.info("HEVC decoder "+hevcDecoder.getName()+" supports HEVC Main10 HDR10");
+@@ -616,6 +647,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+             }
+ 
+             refFrameInvalidationActive = refFrameInvalidationHevc;
++
++            appendHevcAud = selectedDecoderInfo.getName().toLowerCase().startsWith("omx.allwinner");
++            if (appendHevcAud) {
++                LimeLog.info("Decoder "+selectedDecoderInfo.getName()+" will get a trailing AUD per frame");
++            }
+         }
+         else if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_AV1) != 0) {
+             mimeType = "video/av01";
+@@ -661,6 +697,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+             videoDecoder.setOnFrameRenderedListener(new MediaCodec.OnFrameRenderedListener() {
+                 @Override
+                 public void onFrameRendered(MediaCodec mediaCodec, long presentationTimeUs, long renderTimeNanos) {
++                    presentationTimeUs = fixupOutputTimestampUs(presentationTimeUs);
+                     long delta = (renderTimeNanos / 1000000L) - (presentationTimeUs / 1000);
+                     if (delta >= 0 && delta < 1000) {
+                         if (USE_FRAME_RENDER_TIME) {
+@@ -1022,7 +1059,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+                         // Try to output a frame
+                         int outIndex = videoDecoder.dequeueOutputBuffer(info, 50000);
+                         if (outIndex >= 0) {
+-                            long presentationTimeUs = info.presentationTimeUs;
++                            long presentationTimeUs = fixupOutputTimestampUs(info.presentationTimeUs);
+                             int lastIndex = outIndex;
+ 
+                             numFramesOut++;
+@@ -1036,7 +1073,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+                                     numFramesOut++;
+ 
+                                     lastIndex = outIndex;
+-                                    presentationTimeUs = info.presentationTimeUs;
++                                    presentationTimeUs = fixupOutputTimestampUs(info.presentationTimeUs);
+                                 }
+ 
+                                 if (prefs.framePacing == PreferenceConfiguration.FRAME_PACING_MAX_SMOOTHNESS ||
+@@ -1698,6 +1735,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+         // Copy data from our buffer list into the input buffer
+         nextInputBuffer.put(decodeUnitData, 0, decodeUnitLength);
+ 
++        if (appendHevcAud && nextInputBuffer.remaining() >= HEVC_AUD.length) {
++            nextInputBuffer.put(HEVC_AUD);
++            synchronized (audPtsSuccessor) {
++                if (lastAudFrameTimestampUs != 0) {
++                    audPtsSuccessor.put(lastAudFrameTimestampUs, timestampUs);
++                }
++            }
++            lastAudFrameTimestampUs = timestampUs;
++        }
++
+         if (!queueNextInputBuffer(timestampUs, codecFlags)) {
+             return MoonBridge.DR_NEED_IDR;
+         }
+diff --git a/app/src/main/java/com/limelight/nvstream/NvConnectionListener.java b/app/src/main/java/com/limelight/nvstream/NvConnectionListener.java
+index a6109dbf..8e3be076 100644
+--- a/app/src/main/java/com/limelight/nvstream/NvConnectionListener.java
++++ b/app/src/main/java/com/limelight/nvstream/NvConnectionListener.java
+@@ -20,4 +20,5 @@ public interface NvConnectionListener {
+     void setMotionEventState(short controllerNumber, byte motionType, short reportRateHz);
+ 
+     void setControllerLED(short controllerNumber, byte r, byte g, byte b);
++    void setAdaptiveTriggers(short controllerNumber, byte eventFlags, byte typeLeft, byte typeRight, byte[] left, byte[] right);
+ }
+diff --git a/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java b/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
+index 0dcafff5..385e5fae 100644
+--- a/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
++++ b/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
+@@ -328,6 +328,12 @@ public class MoonBridge {
+         }
+     }
+ 
++    public static void bridgeClSetAdaptiveTriggers(short controllerNumber, byte eventFlags, byte typeLeft, byte typeRight, byte[] left, byte[] right) {
++        if (connectionListener != null) {
++            connectionListener.setAdaptiveTriggers(controllerNumber, eventFlags, typeLeft, typeRight, left, right);
++        }
++    }
++
+     public static void setupBridge(VideoDecoderRenderer videoRenderer, AudioRenderer audioRenderer, NvConnectionListener connectionListener) {
+         MoonBridge.videoRenderer = videoRenderer;
+         MoonBridge.audioRenderer = audioRenderer;
+diff --git a/app/src/main/jni/moonlight-core/callbacks.c b/app/src/main/jni/moonlight-core/callbacks.c
+index b9be6917..42aef160 100644
+--- a/app/src/main/jni/moonlight-core/callbacks.c
++++ b/app/src/main/jni/moonlight-core/callbacks.c
+@@ -38,6 +38,7 @@ static jmethodID BridgeClSetHdrModeMethod;
+ static jmethodID BridgeClRumbleTriggersMethod;
+ static jmethodID BridgeClSetMotionEventStateMethod;
+ static jmethodID BridgeClSetControllerLEDMethod;
++static jmethodID BridgeClSetAdaptiveTriggersMethod;
+ static jbyteArray DecodedFrameBuffer;
+ static jshortArray DecodedAudioBuffer;
+ 
+@@ -102,6 +103,7 @@ Java_com_limelight_nvstream_jni_MoonBridge_init(JNIEnv *env, jclass clazz) {
+     BridgeClRumbleTriggersMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClRumbleTriggers", "(SSS)V");
+     BridgeClSetMotionEventStateMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClSetMotionEventState", "(SBS)V");
+     BridgeClSetControllerLEDMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClSetControllerLED", "(SBBB)V");
++    BridgeClSetAdaptiveTriggersMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClSetAdaptiveTriggers", "(SBBB[B[B)V");
+ }
+ 
+ int BridgeDrSetup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
+@@ -389,6 +391,25 @@ void BridgeClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, u
+     }
+ }
+ 
++void BridgeClSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right) {
++    JNIEnv* env = GetThreadEnv();
++
++    jbyteArray leftArray = (*env)->NewByteArray(env, DS_EFFECT_PAYLOAD_SIZE);
++    jbyteArray rightArray = (*env)->NewByteArray(env, DS_EFFECT_PAYLOAD_SIZE);
++    (*env)->SetByteArrayRegion(env, leftArray, 0, DS_EFFECT_PAYLOAD_SIZE, (jbyte*)left);
++    (*env)->SetByteArrayRegion(env, rightArray, 0, DS_EFFECT_PAYLOAD_SIZE, (jbyte*)right);
++
++    // These jbyte casts are necessary to satisfy CheckJNI
++    (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeClSetAdaptiveTriggersMethod, controllerNumber,
++                                 (jbyte)eventFlags, (jbyte)typeLeft, (jbyte)typeRight, leftArray, rightArray);
++    (*env)->DeleteLocalRef(env, leftArray);
++    (*env)->DeleteLocalRef(env, rightArray);
++    if ((*env)->ExceptionCheck(env)) {
++        // We will crash here
++        (*JVM)->DetachCurrentThread(JVM);
++    }
++}
++
+ void BridgeClLogMessage(const char* format, ...) {
+     va_list va;
+     va_start(va, format);
+@@ -426,6 +447,7 @@ static CONNECTION_LISTENER_CALLBACKS BridgeConnListenerCallbacks = {
+         .rumbleTriggers = BridgeClRumbleTriggers,
+         .setMotionEventState = BridgeClSetMotionEventState,
+         .setControllerLED = BridgeClSetControllerLED,
++        .setAdaptiveTriggers = BridgeClSetAdaptiveTriggers,
+ };
+ 
+ static bool
