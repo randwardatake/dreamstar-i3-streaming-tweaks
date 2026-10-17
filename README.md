@@ -1,20 +1,21 @@
-# Linux PC → Android TV box game streaming setup
+# Dreamstar i1 (Allwinner H616) as a 4K60 HDR Moonlight box
 
-Notes, patches and tools from tuning a **Vibepollo** host (a Sunshine/Apollo fork) on a
-CachyOS + KDE Plasma Wayland PC (RTX 3060) streaming to a **Dreamstar i1** TV box
-(Allwinner H616, Android 12) with Moonlight at 4K60 HDR.
+A guide for turning the **Dreamstar i1** Android TV box (Allwinner H616 / H313, Android 12
+`userdebug`) into a lightweight, low-latency game-streaming client, plus the host-side
+setup used with it: a **Vibepollo** (Sunshine/Apollo fork) host on CachyOS + KDE Plasma
+Wayland with an RTX 3060.
 
-What this setup achieves:
+Everything was measured on real hardware. Numbers are from one box and one TV (Samsung
+UE50, 4K60, HDR10), so treat them as a reference, not a promise.
 
-- Monitors and audio come back correctly after a stream ends.
-- HEVC decode latency on the box dropped from about 30 ms to about 7 ms.
-- HDR10 works on the box's decoder.
-- The TV gets a stable 3840x2160p60 output, so the image no longer overscans.
-- A DualSense / DualSense Edge on the box gets rumble, gyro, touchpad, lightbar and
-  adaptive-trigger support.
-- Proton games see HDR during HDR streams.
+**Result:** 4K60 HDR10, 10-bit HDMI output, ~22 ms measured pipeline (encode 9 ms +
+network 1 ms + decode 12 ms), working USB Bluetooth with a DualSense (rumble, gyro,
+touchpad, lightbar, adaptive triggers), and a debloated system that idles at ~2.5 % CPU.
 
-> Everything here is specific to this hardware. Read it before applying it, and keep backups.
+> **Read before you start.** The bootloader is locked and verified boot is `green`.
+> Never modify `/system`, `/vendor`, `vendor_dlkm` or `boot`: the box will not boot again
+> and slot A cannot be used as a fallback. Everything in this guide lives in `/data`
+> and `/sdcard` and is undone by deleting those files.
 
 ---
 
@@ -22,213 +23,333 @@ What this setup achieves:
 
 | Path | What |
 |---|---|
-| `moonlight-patches/moonlight-aud-v12.2.patch` | All Moonlight Android changes, against upstream tag `v12.2` |
-| `kernel-module/` | Backport of mainline `hid-playstation` (v6.6) to the box's 5.4 GKI kernel, with a prebuilt `.ko` |
-| `tools/extract_kcrctab.py` | Rebuilds `Module.symvers` (symbol CRCs) from a kernel Image plus `/proc/kallsyms` |
-| `tools/fftest.c` | Minimal evdev force-feedback rumble test |
-| `tv-box/` | Boot-time hook used to load the module persistently |
-| `host/` | Vibepollo config and the Proton `user_settings.py` hook |
+| `tv-box/runin_config` | The single boot-hook line that applies everything at boot |
+| `tv-box/boot.sh` | Loads the DualSense driver |
+| `bluetooth/` | Realtek USB Bluetooth driver (source + prebuilt `.ko`), bring-up script, boot helper app |
+| `kernel-module/` | Backport of mainline `hid-playstation` (v6.6) to the 5.4 GKI kernel |
+| `moonlight-patches/` | Moonlight Android changes (decode latency, HDR10, DualSense extras) |
+| `tools/dispcfg.c` | Reads / sets the HDMI output config through `/dev/disp` (used for 10-bit) |
+| `tools/fd650-write.c` | Writes text to the front-panel LED display |
+| `tools/sysprof.sh` | Per-process CPU / IRQ / GPU-frequency profile over N seconds |
+| `tools/extract_kcrctab.py` | Rebuilds `Module.symvers` from a kernel Image + `/proc/kallsyms` |
+| `tools/fftest.c` | Minimal evdev rumble test |
+| `host/` | Vibepollo config and the Proton HDR hook |
 
 ---
 
-## 1. Host (Vibepollo on KDE Wayland)
+## 0. Know your box
 
-`/var/lib/vibepollo/vibepollo.conf`:
+| | |
+|---|---|
+| SoC | Allwinner H616 (sun50iw9p1), 4× Cortex-A53 up to 1512 MHz, Mali-G31 MP1 306–600 MHz |
+| RAM | 1.5 GB (+ 1.1 GB zram) |
+| OS | Android 12 `userdebug`, fake `google/raven` fingerprint, **32-bit userspace (armeabi-v7a)** |
+| Kernel | 5.4.125 android12-5.4 GKI, Clang CFI + ThinLTO, `MODVERSIONS=y`, no forced module signing |
+| Root | `adb root` works, SELinux permissive |
+| Slots | Running `_b`; slot `_a` is broken (overwritten by a VAB merge) |
+| PMIC | AXP1530: `dcdc1` = GPU/sys (fixed 960 mV), `dcdc2` = CPU (follows the OPP table), `dcdc3` = DDR 1.5 V |
+| Wi-Fi | On-board SDIO `02E7:9086` (driver `9012p`) **receives nothing on every unit tested**; use Ethernet |
+| Front panel | FD650 4-digit LED clock (`/dev/fd650_dev`), driven by `panelsrv` |
+
+ADB over the network: the vendor `init.oranth.rc` stops `adbd` at boot unless
+`persist.vendor.adb.enabled=1`. Set it once over USB together with `persist.adb.tcp.port=5555`.
+Note that `ro.adb.secure=0` means **anyone on your LAN gets a root shell**. Keep the box on a
+trusted network.
+
+---
+
+## 1. The boot hook (how anything persists)
+
+There is no way to add an init service without touching verified partitions. The box ships
+a factory test script, `/system/bin/runin.sh`, started as root on `sys.boot_completed`. It
+reads `/sdcard/runin_config` and `eval`s every line that starts with `loop=`.
+
+All tweaks in this guide are chained into **one** line in `/sdcard/runin_config`
+(see `tv-box/runin_config`):
+
+```
+loop=0; <step 1>; <step 2>; ...; exit 0
+```
+
+Rules learned the hard way:
+
+- **Append, never overwrite.** Replacing the line to add one feature silently removed the
+  Bluetooth step, and Bluetooth "turned itself off" on every boot.
+- End with `exit 0`, otherwise `runin.sh` continues with its own test cases
+  (screen-timeout changes, memtester, reboots).
+- `runin.sh` can run before the FUSE `/sdcard` mount is ready. `bluetooth/btboot` is a tiny
+  app that, on `BOOT_COMPLETED`, sets `debug.runin.restart=1`, which makes init start
+  `runin_test_restart` again once storage is up.
+
+To undo everything: delete `/sdcard/runin_config` (and uninstall `tr.randward.btboot`) and
+reboot.
+
+---
+
+## 2. Debloat and services
+
+### 2.1 Packages
+
+Use `pm uninstall --user 0 <pkg>`. It is reversible with `cmd package install-existing <pkg>`.
+Removing the Dream/Softwinner bloat, the Google stack (GMS/GSF/Play) and unused streaming apps
+took the box from 139 to 82 packages and from 556 MB to ~860 MB available RAM.
+
+Keep the vendor memory cleaner if you like a one-click "close background apps" button:
+`com.dream.memoryclean` ("dream-clean"). It only calls `killBackgroundProcesses`, contains no
+network code, and freed ~80 MB in a test.
+
+### 2.2 Services that are safe to stop
+
+Measured with `tools/sysprof.sh 120` on an idle box. None of these are marked `critical`,
+so stopping them cannot reboot the box, and `start <name>` or a reboot brings them back.
+
+| Service | Why it can go |
+|---|---|
+| `wificond`, `wpa_supplicant`, `vendor.wifi_hal_legacy`, `dom2reg` + `rmmod 9012p` | Dead Wi-Fi. The driver thread `WL_CMD_THREAD` was the **#1 CPU user on an idle box** |
+| `vendor.ril-daemon`, `radio_monitor-daemon` | No modem |
+| `cameraserver`, `vendor.camera-provider-2-4-ext` | No camera |
+| `isomountservice` | Allwinner ISO mounting |
+| `update_engine` | OTA. With slot A broken, an OTA is a risk anyway |
+| `incidentd`, `traced`, `traced_probes`, `storaged` | Diagnostics / statistics |
+| `awlog_logcatd`, `awlog_kmsgd` | Allwinner daemons that constantly write logcat and kmsg to flash |
+| `vendor.cas-hal-1-2` | Broadcast conditional access |
+
+Also run `cmd wifi set-wifi-enabled disabled` **after** stopping `wificond`. If you stop
+`wificond` while Wi-Fi is enabled, the framework's `WifiSelfRecovery` turns Wi-Fi back on.
+
+Keep: `logd`, `statsd`, `mdnsd` (Moonlight host discovery), `multi_ir` (IR remote), CEC,
+`pqd` (picture quality), DRM, `gpio`, `systemmix`, `panelsrv` (front clock).
+
+Effect: idle CPU (busy jiffies over 120 s) 1303 → 1057 (about −19 %), +17 MB RAM.
+Temperatures did **not** change (see 6), because idle heat on this box is mostly static.
+
+### 2.3 Launcher
+
+The stock Dream launcher idles at ~43 MB PSS and ~0.2 % of a core. Arc Launcher
+(`com.omeda.arc`, an open-source FLauncher descendant, GPL-3.0) idles at ~75 MB but is much
+cleaner. Use the `armeabi-v7a` APK and set it with:
+
+```sh
+adb shell cmd package set-home-activity com.omeda.arc/.MainActivity
+```
+
+The choice can reset after a framework restart, so the boot hook re-applies it and fires a
+HOME intent. Disable Arc's video wallpaper and backdrop blur on this GPU.
+
+---
+
+## 3. USB Bluetooth (TP-Link UB500 / RTL8761BU)
+
+The box has no working on-board Bluetooth. A TP-Link UB500 (`2357:0604`) works with:
+
+1. `bluetooth/rtk_btusb-5.4.125-gki.ko`, Realtek's `rtk_btusb` 5.2.1 patched for 5.4 and the
+   TP-Link ID. It was built with Android `clang-r416183b1` against the Orange Pi 5.4.125
+   sun50iw9 tree, with CRCs taken from the real kernel's `__kcrctab`. The source is in
+   `bluetooth/src`.
+2. `bluetooth/rtkbt-up.sh`, which:
+   - loads the module;
+   - points `/dev/ttyAS1` (hard-coded in `libbt-realtek`) at the USB driver;
+   - bind-mounts `libbt-realtek.so` over `libbt-vendor.so` and adds a config;
+   - sets `persist.log.tag.bluetooth_support=1`, so `system_server` creates the Bluetooth
+     service, and `bluetooth_vendor=realtek`;
+   - enables Bluetooth.
+3. The stock `/vendor` already contains `rtl8761b_fw` / `rtl8761b_config`.
+
+Copy the files to `/data/local/tmp/rtkbt/` and add `sh /data/local/tmp/rtkbt/rtkbt-up.sh` to
+the boot hook.
+
+**Symptom of a missing boot step:** the Bluetooth toggle switches on and immediately back off.
+
+---
+
+## 4. Video: HDMI, HDR and 10-bit
+
+### 4.1 Resolution
+
+`displayd` with `persist.sys.hdmistrategy=255` (auto) picks the "perfect mode" 4096×2160,
+which overscans on a 3840 panel. `persist.sys.hdmistrategy=0` makes it keep the saved mode.
+Line 2 of `/Reserve0/disp_rsl.fex` is `type<<8 | mode` (`422` = HDMI, mode 34 = 3840×2160p60).
+
+### 4.2 How to read the output state
+
+```sh
+cat /sys/class/disp/disp/attr/sys | grep mgr0
+# mgr0: 3840x2160 fmt[yuv420] cs[0x107] range[limit] eotf[0x10] bits[10bits]
+```
+
+| Field | Values |
+|---|---|
+| `eotf` | `0x4` gamma 2.2 (SDR), **`0x10` SMPTE 2084 / PQ (HDR10)**, `0x12` HLG |
+| `cs` | `0x101` BT.709, **`0x107` BT.2020 NC** |
+| `bits` | `8bits` / `10bits` |
+
+`persist.disp.device_config.hdmi` = `type,mode,format,bits,eotf,cs`, e.g. `4,34,3,1,16,263`.
+The same values are stored in `/Reserve0/disp_rsl.fex` as `hdmi_config=format,bits,eotf,cs,…`.
+`displayd` rewrites both from its own decision, so editing them alone does not stick.
+
+### 4.3 HDR: keep it fixed, do not use AUTO
+
+`persist.disp.dataspace.hdmi` selects AUTO / SDR / WCG / HDR. In AUTO (`0`), `displayd`
+switches HDMI between SDR and HDR10 when an HDR layer appears. **On this box and TV, every
+switch left the TV without a picture and the TV buzzed.** The stable setup is a fixed HDR10
+output (`dataspace=1`, `eotf=0x10`, `cs=0x107`). HDR content (Moonlight HDR, HDR10 video) is
+correct; SDR UI is shown inside the HDR container.
+
+Restarting the composer (`vendor.hwcomposer-2-2`) to re-read display props restarts the whole
+Android framework.
+
+### 4.4 10-bit output
+
+`displayd`'s `EdidStrategy` forces 8-bit at boot, although the TV's EDID advertises
+*"10-bits/component Deep Color 4:2:0"* and lists 3840×2160@60 (VIC 97) in its 4:2:0 capability
+map. 8-bit PQ shows banding in gradients.
+
+`tools/dispcfg.c` talks to the kernel display driver directly (`DISP_DEVICE_GET_CONFIG` 0x15 /
+`DISP_DEVICE_SET_CONFIG` 0x14 on `/dev/disp`) and changes only the bit depth:
+
+```sh
+armv7a-linux-androideabi31-clang -O2 -o dispcfg tools/dispcfg.c
+adb push dispcfg /data/local/tmp/ && adb shell /data/local/tmp/dispcfg      # read
+adb shell /data/local/tmp/dispcfg 1                                          # 10-bit
+adb shell /data/local/tmp/dispcfg 0                                          # back to 8-bit
+```
+
+Put `/data/local/tmp/dispcfg 1` at the end of the boot hook. Check your TV's EDID first
+(`/sys/class/hdmi/hdmi/attr/edid` → `edid-decode`). If the TV does not list 10-bit 4:2:0 at
+4K60, do not do this.
+
+Still open: whether a TV power cycle (HDMI re-negotiation) drops it back to 8-bit.
+
+### 4.5 TV settings (biggest latency win)
+
+On the Samsung, **HDR+ Mode** blocks **Game Mode** ("this function is not available"). Turning
+HDR+ off and Game Mode on removed most of the perceived input lag. It mattered far more than
+any box or host tweak. Also enable **Input Signal Plus** for the box's HDMI port, which is
+needed for 4K60 HDR.
+
+---
+
+## 5. Moonlight
+
+### 5.1 Decode latency: 30 ms → 7–12 ms (patch)
+
+The CedarX HEVC stream buffer manager (`sbmFrameH265`) only closes an Annex-B access unit when
+the *next* AU starts, so every frame waited one frame interval inside the decoder. The patched
+Moonlight appends an Access Unit Delimiter (`00 00 00 01 46 01 50`) after each frame, only for
+`OMX.allwinner.*`, and remaps the off-by-one output pts. Package `com.limelight.aud`, built
+from `moonlight-patches/moonlight-aud-v12.2.patch`.
+
+### 5.2 HDR10
+
+The Allwinner decoder does not advertise HEVC Main10 HDR10 but decodes it.
+`isHevcMain10Hdr10Supported()` returns true for `OMX.allwinner` in the patch.
+
+### 5.3 Measured pipeline (4K60 HDR10, HEVC, 100 Mbit Ethernet)
+
+| Stage | Time | How |
+|---|---|---|
+| Host encode (NVENC P1, single pass) | 9 ms | Moonlight overlay "host processing" |
+| Network | 1 ms | overlay |
+| Box decode (patched) | 12 ms | overlay |
+| Box queue → on screen | 22 ms | `dumpsys SurfaceFlinger --latency` on the Moonlight `SurfaceView` |
+
+The video layer is composed by HWC as `DEVICE` (overlay), not by the GPU. Frame pacing
+"lowest latency" vs "balanced" made only a small difference.
+
+### 5.4 DualSense
+
+See `kernel-module/` (mainline `hid-playstation` backported to 5.4, with CRCs matched to the
+running kernel) and the Moonlight patch (gyro, lightbar, adaptive triggers through
+`/dev/hidraw`). HD haptics are not possible: Vibepollo's virtual DualSense is HID-only.
+
+---
+
+## 6. Thermals, CPU and GPU
+
+- **Idle temperatures are high**: CPU ~73 °C, GPU ~75–77 °C, DDR ~72 °C, VE ~70 °C, with the
+  passive trip point at 70 °C. With 97 % idle CPU, this is mostly static power plus a box that
+  cannot get rid of heat. Ventilation (stand the box up, leave space, a small USB fan) helps
+  more than software.
+- **GPU overclocking is pointless here.** The Mali-G31 spent ~100 % of uptime at its lowest
+  306 MHz, even while streaming, because video is decoded by the VE and composed as an HWC
+  overlay. Raising the clock only adds heat. Its rail (`dcdc1`) is shared with the rest of
+  the SoC and does not scale with frequency.
+- **CPU:** OPPs 480–1032 MHz at 900 mV, 1296 at 1050 mV, 1512 at 1150 mV.
+  `dev_pm_opp_add` / `dev_pm_opp_remove` are exported, so a small module could re-add the OPPs
+  at lower voltages (undervolt) without touching `boot`. This is not done yet.
+- While streaming: CPU/GPU/VE/DDR ~78–82 °C, no throttling observed.
+
+---
+
+## 7. Front panel clock (FD650)
+
+`/vendor/bin/panelsrv` opens `/dev/fd650_dev` with `O_RDWR`, keeps it open, and writes 6
+bytes every second:
+
+```
+[digit0][digit1][digit2][digit3][colon 0/1][0x08]     digits are ASCII, e.g. "1234"
+```
+
+Writes from a shell redirect (`printf … > /dev/fd650_dev`, `O_WRONLY`, reopened every time)
+are accepted but **not shown**. Open with `O_RDWR` and keep the fd, as in
+`tools/fd650-write.c`:
+
+```sh
+stop panelsrv; /data/local/tmp/fd650-write 1234 1; start panelsrv
+```
+
+Whether letters render is not verified yet. `panelsrv` is one of the top idle CPU users
+(~0.6 % of a core), so a smarter replacement could also save CPU.
+
+---
+
+## 8. Host (Vibepollo on KDE Plasma Wayland)
+
+`/var/lib/vibepollo/vibepollo.conf` (see `host/vibepollo.conf`):
 
 ```ini
 encoder = nvenc
+nvenc_preset = 1           # was 3
+nvenc_twopass = disabled   # P3 two-pass measured 13–27 ms encode, P1 single-pass 9 ms
+max_bitrate = 70000
 dd_paused_virtual_display_timeout_secs = 15
 dd_config_revert_on_disconnect = enabled
-max_bitrate = 70000
-nvenc_preset = 3
 wayland_hdr_compatibility = enabled
 ```
 
-- **Displays and audio not restored after a stream.** A Moonlight disconnect only
-  *pauses* the session, so Vibepollo kept the virtual display (`Virtual-1`) and its
-  audio sink. The physical monitors stayed off until a TTY switch.
-  `dd_config_revert_on_disconnect = enabled` restores the topology and the default
-  sink on disconnect.
-- **Bitrate.** An iperf3 UDP test to the box was clean up to about 95 Mbps (the box
-  has 100 Mbit Ethernet), so the cap is set to 70 Mbps. `nvenc_preset = 3` trades a
-  little quality for lower encode time.
-- **File ownership.** Every file in `/var/lib/vibepollo` must be owned by
-  `vibepollo:vibepollo` with mode `0600`. A single root-owned file (even a backup) makes
-  `vibepollo-machine-host` refuse to start with "machine profile permissions are unsafe".
-- **Restarting.** `systemctl restart vibepollo.service` is fine; the
-  `vibepollo-session-controller` rebinds it to the Plasma session.
+- **Monitors / audio not restored after a stream:** `dd_config_revert_on_disconnect = enabled`.
+- **File ownership:** every file in `/var/lib/vibepollo` must be `vibepollo:vibepollo`, mode
+  `0600`. One root-owned backup makes the host refuse to start.
+- **Session history:** `/var/lib/vibepollo/session_history/session_history.db` (SQLite) has
+  per-second `encode_latency_ms`, `actual_fps`, `frame_interval_jitter_ms`, GPU %, and IDR
+  counts. Low fps while GPU usage is ~1 % is normal: capture is event-driven and static
+  screens send fewer frames.
+- **Frame cap:** during streams Vibepollo caps Proton games to the stream fps. With in-game
+  V-Sync also on, a missed frame halves the fps, so turn in-game V-Sync off.
+- **HDR in Proton games:** copy `host/proton-user_settings.py` and
+  `_vibepollo_frame_limiter.py` into the Proton you actually use. System Protons in
+  `/usr/share/steam/compatibilitytools.d` do not get the hook automatically.
 
-### HDR in Proton games (e.g. God of War)
+### Frame generation on RTX 30 (Yakuza Kiwami 2, Lutris + GE-Proton)
 
-Vibepollo injects HDR variables into Proton launches during HDR streams:
-`PROTON_ENABLE_HDR`, `DXVK_HDR`, plus `PROTON_ENABLE_WAYLAND` and `ENABLE_HDR_WSI` when
-`wayland_hdr_compatibility` is on.
+DLSS Frame Generation works on an RTX 3060 with
+[dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) under Proton, given:
 
-It does this through a `user_settings.py` hook that is only written into Proton
-installs under `~/.local/share/Steam/compatibilitytools.d`. Steam's default tool here,
-`proton-cachyos-slr`, lives in `/usr/share/steam/compatibilitytools.d`. That copy
-never got the hook, so games using it never saw HDR.
+- Install its proxy as `dxgi.dll`. Lutris already overrides `dxgi` as native, while the
+  default `version.dll` proxy is not loaded.
+- Set `PROTON_NVIDIA_NVCUDA=1`. Its backend runs CUDA kernels, and the default Proton
+  `nvcuda.dll` is a stub ("Missing cuInit").
+- Set `PROTON_DLSS_UPGRADE=0`. Otherwise Proton's `nvngx_dlssg.dll` replaces the bundled
+  runtime.
+- Make the files user-owned, or it cannot write its logs.
 
-Fix:
-
-1. Copy the hook (`host/proton-user_settings.py` and `_vibepollo_frame_limiter.py`)
-   into the system Proton directory.
-2. Enable `wayland_hdr_compatibility`. Without the Wayland driver, games on XWayland
-   cannot see HDR.
-
-The hook asks the running Vibepollo over a Unix socket, so outside a stream it does
-nothing. The two `.py` files are not owned by the package, so they survive Proton
-updates.
-
-### Yakuza Kiwami 2 (2025 update, Lutris, GE-Proton)
-
-The 2025 update added DLSS and FSR. `PROTON_DLSS_UPGRADE=1` in the Lutris game env
-pulls the newest DLSS DLL. DLSS Frame Generation is not supported on RTX 30-series
-cards.
-
----
-
-## 2. TV box (Dreamstar i1 / Allwinner H616 / Android 12 userdebug)
-
-The box is `userdebug` with `adb root`, SELinux is permissive and the active slot is
-`_b`.
-
-**The bootloader is locked and verified boot is `green`.** Do not modify `/system`,
-`/vendor`, `vendor_dlkm` or `boot`: the box will not boot. Everything below lives in
-`/data`.
-
-### 2.1 HDMI output overscan / wrong resolution
-
-`displayd` with `persist.sys.hdmistrategy=255` (auto) always picks the "perfect mode"
-4096x2160, which overscans on the TV. A non-255 strategy makes it reuse the saved mode
-instead:
-
-```sh
-adb shell setprop persist.sys.hdmistrategy 0
-# saved mode 34 = 3840x2160p60 (line 2 of /Reserve0/disp_rsl.fex = 0x422)
-```
-
-After a reboot the log shows `hdmi user strategy: 0` and `hdmi output mode(34) 3840x2160`.
-
-### 2.2 Decode latency: 30 ms → 7 ms (Moonlight patch)
-
-**Root cause.** The CedarX HEVC stream buffer manager (`sbmFrameH265`) only closes an
-Annex-B access unit when it sees the *next* AU: the next frame's first slice, or a
-VPS/SPS/PPS/AUD/SEI NAL. Every frame therefore sat in the decoder until the following
-frame arrived, which costs a full frame of latency plus jitter.
-
-**Fix.** Moonlight appends an Access Unit Delimiter (`00 00 00 01 46 01 50`) after each
-frame it submits, but only for `OMX.allwinner.*` decoders. The AUD closes the AU
-immediately.
-
-The decoder then stamps each output with the pts of the *previous* input (the AUD's
-pts). Moonlight keeps a small map from that pts to the real one and fixes the output
-timestamps, so frame pacing and the stats overlay stay correct.
-
-### 2.3 HDR10 "not supported" (Moonlight patch)
-
-The Allwinner decoder does not advertise the HEVC Main10 HDR10 profile even though it
-decodes it fine. `isHevcMain10Hdr10Supported()` now returns true for `OMX.allwinner`.
-
-### 2.4 DualSense on a 5.4 kernel (kernel module)
-
-The box's kernel (5.4.125, android12-5.4 GKI, Clang CFI + ThinLTO) has no
-`hid-playstation` driver. A DualSense is bound by `hid-generic`, so it has buttons and
-sticks but no rumble, motion sensors, touchpad or battery reporting.
-
-**Backport build:**
-
-1. Pull the kernel source and toolchain:
-   - kernel: `kernel/common` branch `android12-5.4`, with `SUBLEVEL` set to `125`;
-   - compiler: AOSP `clang-r416183b`, the same LLVM commit the box kernel was built
-     with. CFI modules must match the compiler.
-2. Configure it with the box's `/proc/config.gz`, plus
-   `CONFIG_ANDROID_KABI_RESERVE=y` and `CONFIG_ANDROID_VENDOR_OEM_DATA=y`. With those,
-   genksyms CRCs for hid-core, input, ff-memless and driver-core match the running
-   kernel exactly, so struct layouts are identical.
-3. Pull the running slot's `boot_b` and extract the kernel Image. Generate
-   `Module.symvers` with `tools/extract_kcrctab.py`.
-4. Patch v6.6 `hid-playstation.c` (`kernel-module/src/hid-playstation-5.4-backport.patch`
-   and `compat.h`):
-   - 5.4 has no LED multicolor class, so a failed lightbar LED registration is non-fatal
-     (the lightbar is driven from userspace instead, see 2.5);
-   - force-feedback support is compiled in with `-DCONFIG_PLAYSTATION_FF=1`;
-   - a `ds5_debug` module parameter logs every output report.
-
-   Then build:
-
-```sh
-make -C ack12 ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
-     M=$PWD/src KDIR=$PWD/ack12 modules
-```
-
-**Persistence without touching verified partitions.** The factory test script
-`/system/bin/runin.sh` runs as root (shell domain) on `sys.boot_completed`. It reads
-`/sdcard/runin_config` and `eval`s any `loop=` line. The single line in
-`tv-box/runin_config` makes it run `/data/local/ds5/boot.sh`, which `insmod`s the
-module. Keep any test-case lines out of that file, or the script will run its
-memtester/reboot tests.
-
-**Key layout.** Android has no layout for the Edge (product `0df2`).
-`/data/system/devices/keylayout/Vendor_054c_Product_0df2.kl` is a copy of the stock
-`Vendor_054c_Product_0ce6.kl`. It maps the triggers correctly and declares the
-accelerometer and gyro axes.
-
-**Result.** Android reports the pad as `GAMEPAD | VIBRATOR` and the motion device as
-`SENSOR`, with the touchpad as a separate device.
-
-### 2.5 Moonlight: gyro, lightbar and adaptive triggers (Moonlight patch)
-
-- **Gyro / accelerometer.** Upstream defaults the motion-sensor option to off on
-  Android 12 because of a framework NPE in `InputDeviceSensorManager`. The patch
-  installs an uncaught-exception filter that swallows only that NPE on non-main threads,
-  so the option can be enabled (`checkbox_gamepad_motion_sensors=true`).
-- **Lightbar and adaptive triggers.** These are handled by the new class
-  `DualSenseHidraw.java`:
-  - it finds the controller's `/dev/hidrawN`, which Android's ueventd already makes
-    `0666`;
-  - it writes DualSense output reports directly: BT report `0x31` with CRC32 seeded by
-    `0xA2`, or USB report `0x02`;
-  - only the relevant valid-flags are set, so these reports never fight the kernel
-    driver's rumble reports.
-- **Lightbar color.** Host `setControllerLED` events now reach the controller, and
-  the RGB-LED capability is advertised to the host.
-- **Adaptive triggers.** `moonlight-common-c` already parsed Sunshine's `0x5503`
-  packets, but the Android app never registered the callback. The patch wires it through
-  JNI (`BridgeClSetAdaptiveTriggers`), `MoonBridge` and `NvConnectionListener` into
-  `ControllerHandler`. When the stream ends, the triggers are reset (effect `0x05`, off).
-
-**HD haptics are not possible on this stack.** Games send HD haptics as channels 3–4
-of the DualSense USB audio device. Vibepollo's virtual DualSense is HID-only, the
-Moonlight protocol has no haptics stream, and the Bluetooth haptics report format is
-still being reverse-engineered.
-
-### 2.6 Build the patched Moonlight
-
-```sh
-git clone https://github.com/moonlight-stream/moonlight-android && cd moonlight-android
-git checkout v12.2 && git submodule update --init --recursive
-git apply ../moonlight-patches/moonlight-aud-v12.2.patch
-./gradlew assembleNonRootRelease   # JDK 21, SDK platform 37, NDK 29
-zipalign -p 4 app/build/outputs/apk/nonRoot/release/app-nonRoot-release-unsigned.apk aligned.apk
-apksigner sign --ks <your.jks> --out moonlight-aud.apk aligned.apk
-```
-
-The package is `com.limelight.aud`, so it installs next to the official app. To reuse
-an existing pairing, copy `client.crt`, `client.key`, `uniqueid` and `computers4.db`
-from `com.limelight`.
-
-### 2.7 Thermals (for reference)
-
-While streaming 4K60 HDR, the CPU, GPU, video engine and DDR all sit at about
-78–82 °C. The first passive trip point is at 70 °C and critical is at 115 °C. No
-throttling was observed, and clocks are stock (CPU up to 1512 MHz, GPU up to 600 MHz,
-VE 696 MHz).
+On a 60 fps stream, frame generation halves the real frame rate (30 real + 30 generated) and
+makes cutscenes in Dragon Engine games run in slow motion, so leave it off when streaming.
 
 ---
 
 ## Licenses
 
-- The Moonlight patch is a derivative of moonlight-android and is GPLv3.
-- `hid-playstation` and its backport are GPL-2.0.
-- The tools in this repo are MIT.
+- Moonlight patch: derivative of moonlight-android, GPLv3.
+- `hid-playstation` backport and `rtk_btusb`: GPL-2.0.
+- Tools and scripts in this repo: MIT.
